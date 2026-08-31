@@ -1,3 +1,80 @@
+#!/usr/bin/env bash
+set -e
+echo 'Rebuilding project structure...'
+rm -rf src api index.html package.json vite.config.js .gitignore
+mkdir -p src api
+
+cat > index.html << 'CLAUDE_REBUILD_EOF'
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#0B2E33" />
+    <title>Herring Spawn &amp; Habitat Explorer</title>
+  </head>
+  <body style="margin:0; overscroll-behavior: none;">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+CLAUDE_REBUILD_EOF
+
+cat > package.json << 'CLAUDE_REBUILD_EOF'
+{
+  "name": "herring-spawn-habitat-explorer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7",
+    "lucide-react": "^0.383.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0"
+  }
+}
+CLAUDE_REBUILD_EOF
+
+cat > vite.config.js << 'CLAUDE_REBUILD_EOF'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+});
+CLAUDE_REBUILD_EOF
+
+cat > .gitignore << 'CLAUDE_REBUILD_EOF'
+node_modules
+dist
+.vercel
+.DS_Store
+CLAUDE_REBUILD_EOF
+
+cat > src/main.jsx << 'CLAUDE_REBUILD_EOF'
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App.jsx";
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+CLAUDE_REBUILD_EOF
+
+cat > src/App.jsx << 'CLAUDE_REBUILD_EOF'
 import React, { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceArea, ResponsiveContainer, CartesianGrid } from "recharts";
 import { Waves, Layers, Info, X, TrendingUp, Anchor, ZoomIn, ZoomOut, Locate, CheckCircle2, XCircle, Loader2, RefreshCw, Satellite } from "lucide-react";
@@ -1003,3 +1080,55 @@ function pillStyle(active) {
     cursor: "pointer",
   };
 }
+CLAUDE_REBUILD_EOF
+
+cat > api/dfo-proxy.js << 'CLAUDE_REBUILD_EOF'
+// Vercel serverless function (Node runtime).
+// Runs server-side, so DFO's lack of CORS headers doesn't matter here —
+// only matters for browser-to-DFO calls, not server-to-DFO calls.
+// Deployed automatically by Vercel because it lives in /api.
+
+const SOURCES = {
+  arcgis:
+    "https://gisp.dfo-mpo.gc.ca/arcgis/rest/services/FGP/Pacific_Herring_Spawn_Index_Data/MapServer/0/query?where=1%3D1&outFields=*&f=json&resultRecordCount=25",
+  csv:
+    "https://api-proxy.edh-cde.dfo-mpo.gc.ca/catalogue/records/d892511c-d851-4f85-a0ec-708bc05d2810/attachments/Pacific_herring_spawn_index_data_2025_EN.csv",
+};
+
+export default async function handler(req, res) {
+  const source = req.query.source;
+  const upstream = SOURCES[source];
+
+  if (!upstream) {
+    res.status(400).json({ error: `Unknown source '${source}'. Use ?source=arcgis or ?source=csv.` });
+    return;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const upstreamRes = await fetch(upstream, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!upstreamRes.ok) {
+      res.status(upstreamRes.status).json({ error: `DFO responded ${upstreamRes.status} ${upstreamRes.statusText}`, upstream });
+      return;
+    }
+
+    const body = await upstreamRes.text();
+    const contentType = upstreamRes.headers.get("content-type") || (source === "csv" ? "text/csv" : "application/json");
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate"); // DFO updates this ~annually
+    res.setHeader("Content-Type", contentType);
+    res.status(200).send(body);
+  } catch (err) {
+    res.status(502).json({ error: `Proxy fetch failed: ${err.name}: ${err.message}`, upstream });
+  }
+}
+CLAUDE_REBUILD_EOF
+
+git add -A
+git commit -m "Rebuild via Codespaces: correct structure + latest fixes"
+git push
+echo 'Done. Check the Vercel deployments tab.'

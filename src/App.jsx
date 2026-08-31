@@ -258,6 +258,12 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
   const [center, setCenter] = useState({ lat: 51.4, lon: -127.3 });
   const dragRef = useRef(null);
   const wheelLock = useRef(false);
+  // kept fresh every render so the touch listeners (attached once, imperatively)
+  // never read stale zoom/center/size from a closure captured at mount time
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const sizeRef = useRef(size);
+  sizeRef.current = size;
 
   useEffect(() => {
     function measure() {
@@ -270,7 +276,27 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
     return () => window.removeEventListener("resize", measure);
   }, []);
 
+  // Safari's legacy pinch gesture (gesturestart/change/end) runs alongside,
+  // not through, native touch handling — touch-action:none doesn't reliably
+  // stop it. Without this, iOS can zoom the whole page on a 2-finger touch
+  // even though our touchstart/touchmove logic also fires underneath it.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const prevent = (e) => e.preventDefault();
+    el.addEventListener("gesturestart", prevent);
+    el.addEventListener("gesturechange", prevent);
+    el.addEventListener("gestureend", prevent);
+    return () => {
+      el.removeEventListener("gesturestart", prevent);
+      el.removeEventListener("gesturechange", prevent);
+      el.removeEventListener("gestureend", prevent);
+    };
+  }, []);
+
   const centerPx = { x: lonToX(center.lon, zoom), y: latToY(center.lat, zoom) };
+  const centerPxRef = useRef(centerPx);
+  centerPxRef.current = centerPx;
   const topLeft = { x: centerPx.x - size.w / 2, y: centerPx.y - size.h / 2 };
   const n = Math.pow(2, zoom);
 
@@ -293,23 +319,135 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
     }
   }
 
-  function changeZoom(delta, focalScreen) {
-    setZoom((z) => {
-      const nz = clamp(z + delta, 3, 12);
-      if (nz === z) return z;
-      return nz;
-    });
+  // Touch is handled with the raw TouchEvent API, attached imperatively with
+  // { passive: false } — this is the older API, but unlike Pointer Events it
+  // has been consistently supported and its preventDefault() is guaranteed
+  // to actually block the browser's native scroll/zoom, which is what was
+  // silently failing before. Mouse/trackpad still use React's onMouseDown.
+  const pointersRef = useRef(new Map());
+  const pinchRef = useRef(null);
+  const wrapperRef = useRef(null);
+
+  function commitPinch() {
+    const { startZoom, anchorLon, anchorLat, liveScale, liveMid } = pinchRef.current;
+    const newZoom = clamp(Math.round(startZoom + Math.log2(liveScale || 1)), 3, 12);
+    const anchorWorldNew = { x: lonToX(anchorLon, newZoom), y: latToY(anchorLat, newZoom) };
+    const topLeftNew = { x: anchorWorldNew.x - liveMid.x, y: anchorWorldNew.y - liveMid.y };
+    const centerPxNew = { x: topLeftNew.x + sizeRef.current.w / 2, y: topLeftNew.y + sizeRef.current.h / 2 };
+    const newCenter = { lon: xToLon(centerPxNew.x, newZoom), lat: yToLat(centerPxNew.y, newZoom) };
+    setZoom(newZoom);
+    setCenter(newCenter);
+    pinchRef.current = null;
+    if (wrapperRef.current) {
+      wrapperRef.current.style.transform = "";
+      wrapperRef.current.style.transformOrigin = "";
+    }
+    return centerPxNew;
   }
 
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    function relTouch(t) {
+      const rect = el.getBoundingClientRect();
+      return { x: t.clientX - rect.left, y: t.clientY - rect.top, clientX: t.clientX, clientY: t.clientY };
+    }
+
+    function onTouchStart(e) {
+      e.preventDefault();
+      for (const t of e.changedTouches) pointersRef.current.set(t.identifier, relTouch(t));
+
+      if (pointersRef.current.size === 1) {
+        const [[id, p]] = pointersRef.current;
+        dragRef.current = { id, x: p.clientX, y: p.clientY, cx: centerPxRef.current.x, cy: centerPxRef.current.y };
+      } else if (pointersRef.current.size === 2) {
+        dragRef.current = null;
+        const [p0, p1] = Array.from(pointersRef.current.values());
+        const dist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+        const mid = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+        const topLeftNow = { x: centerPxRef.current.x - sizeRef.current.w / 2, y: centerPxRef.current.y - sizeRef.current.h / 2 };
+        pinchRef.current = {
+          startDistance: dist,
+          startMid: mid,
+          startZoom: zoomRef.current,
+          anchorLon: xToLon(topLeftNow.x + mid.x, zoomRef.current),
+          anchorLat: yToLat(topLeftNow.y + mid.y, zoomRef.current),
+          liveScale: 1,
+          liveMid: mid,
+        };
+      }
+    }
+
+    function onTouchMove(e) {
+      e.preventDefault();
+      for (const t of e.changedTouches) {
+        if (pointersRef.current.has(t.identifier)) pointersRef.current.set(t.identifier, relTouch(t));
+      }
+
+      if (pointersRef.current.size >= 2 && pinchRef.current) {
+        const [p0, p1] = Array.from(pointersRef.current.values()).slice(0, 2);
+        const dist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+        const mid = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+        const scale = dist / pinchRef.current.startDistance;
+        const shiftX = mid.x - pinchRef.current.startMid.x;
+        const shiftY = mid.y - pinchRef.current.startMid.y;
+        if (wrapperRef.current) {
+          wrapperRef.current.style.transformOrigin = `${pinchRef.current.startMid.x}px ${pinchRef.current.startMid.y}px`;
+          wrapperRef.current.style.transform = `translate(${shiftX}px, ${shiftY}px) scale(${scale})`;
+        }
+        pinchRef.current.liveScale = scale;
+        pinchRef.current.liveMid = mid;
+        return;
+      }
+
+      if (!dragRef.current) return;
+      const p = pointersRef.current.get(dragRef.current.id);
+      if (!p) return;
+      const dx = p.clientX - dragRef.current.x;
+      const dy = p.clientY - dragRef.current.y;
+      const nx = dragRef.current.cx - dx;
+      const ny = dragRef.current.cy - dy;
+      setCenter({ lon: xToLon(nx, zoomRef.current), lat: yToLat(ny, zoomRef.current) });
+    }
+
+    function onTouchEnd(e) {
+      for (const t of e.changedTouches) pointersRef.current.delete(t.identifier);
+
+      if (pinchRef.current && pointersRef.current.size < 2) {
+        const centerPxNew = commitPinch();
+        const remaining = Array.from(pointersRef.current.entries())[0];
+        if (remaining) {
+          const [id, pos] = remaining;
+          dragRef.current = { id, x: pos.clientX, y: pos.clientY, cx: centerPxNew.x, cy: centerPxNew.y };
+        }
+      } else if (dragRef.current && pointersRef.current.size === 0) {
+        dragRef.current = null;
+      }
+    }
+
+    el.addEventListener("touchstart", onTouchStart, { passive: false });
+    el.addEventListener("touchmove", onTouchMove, { passive: false });
+    el.addEventListener("touchend", onTouchEnd, { passive: false });
+    el.addEventListener("touchcancel", onTouchEnd, { passive: false });
+    return () => {
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("touchend", onTouchEnd);
+      el.removeEventListener("touchcancel", onTouchEnd);
+    };
+  }, []);
+
+  // Mouse/trackpad path (desktop) — untouched by the touch logic above.
   const onMouseDown = useCallback(
     (e) => {
-      dragRef.current = { x: e.clientX, y: e.clientY, cx: centerPx.x, cy: centerPx.y };
+      dragRef.current = { id: "mouse", x: e.clientX, y: e.clientY, cx: centerPx.x, cy: centerPx.y };
     },
     [centerPx.x, centerPx.y]
   );
   const onMouseMove = useCallback(
     (e) => {
-      if (!dragRef.current) return;
+      if (!dragRef.current || dragRef.current.id !== "mouse") return;
       const dx = e.clientX - dragRef.current.x;
       const dy = e.clientY - dragRef.current.y;
       const nx = dragRef.current.cx - dx;
@@ -318,8 +456,8 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
     },
     [zoom]
   );
-  const endDrag = useCallback(() => {
-    dragRef.current = null;
+  const endMouseDrag = useCallback(() => {
+    if (dragRef.current && dragRef.current.id === "mouse") dragRef.current = null;
   }, []);
 
   const onWheel = useCallback((e) => {
@@ -340,8 +478,8 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
       ref={containerRef}
       onMouseDown={onMouseDown}
       onMouseMove={onMouseMove}
-      onMouseUp={endDrag}
-      onMouseLeave={endDrag}
+      onMouseUp={endMouseDrag}
+      onMouseLeave={endMouseDrag}
       onWheel={onWheel}
       style={{
         position: "relative",
@@ -352,30 +490,32 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
         cursor: dragRef.current ? "grabbing" : "grab",
         borderRadius: 4,
         userSelect: "none",
+        touchAction: "none", // stop the phone from scrolling/pinch-zooming the page instead of the map
       }}
     >
-      {tiles.map((t) => (
-        <img
-          key={t.key}
-          src={t.url}
-          alt=""
-          draggable={false}
-          style={{
-            position: "absolute",
-            left: t.left,
-            top: t.top,
-            width: TILE,
-            height: TILE,
-            pointerEvents: "none",
-            filter: "saturate(0.85) brightness(0.95)",
-          }}
-        />
-      ))}
+      <div ref={wrapperRef} style={{ position: "absolute", inset: 0 }}>
+        {tiles.map((t) => (
+          <img
+            key={t.key}
+            src={t.url}
+            alt=""
+            draggable={false}
+            style={{
+              position: "absolute",
+              left: t.left,
+              top: t.top,
+              width: TILE,
+              height: TILE,
+              pointerEvents: "none",
+              filter: "saturate(0.85) brightness(0.95)",
+            }}
+          />
+        ))}
 
-      {/* tint to blend tiles with chart palette */}
-      <div style={{ position: "absolute", inset: 0, background: "linear-gradient(180deg, rgba(11,46,51,0.15), rgba(11,46,51,0.35))", pointerEvents: "none" }} />
+        {/* tint to blend tiles with chart palette */}
+        <div style={{ position: "absolute", inset: 0, background: "linear-gradient(180deg, rgba(11,46,51,0.15), rgba(11,46,51,0.35))", pointerEvents: "none" }} />
 
-      {units.map((u) => {
+        {units.map((u) => {
         const px = lonToX(u.lon, zoom) - topLeft.x;
         const py = latToY(u.lat, zoom) - topLeft.y;
         if (px < -30 || px > size.w + 30 || py < -30 || py > size.h + 30) return null;
@@ -386,7 +526,6 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
         return (
           <div
             key={u.id}
-            onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
               onSelect(u.id);
@@ -456,6 +595,7 @@ function TileBasemap({ units, layer, year, selectedId, onSelect, matchesHabitat 
           </div>
         );
       })}
+      </div>
 
       {/* zoom controls */}
       <div style={{ position: "absolute", top: 12, right: 12, display: "flex", flexDirection: "column", gap: 4 }}>
